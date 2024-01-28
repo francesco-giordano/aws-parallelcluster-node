@@ -38,6 +38,7 @@ EC2_SCHEDULED_EVENT_CODES = [
 
 CONFIG_FILE_DIR = "/etc/parallelcluster/slurm_plugin"
 
+node_failure_count = {"health": {}, "bootstrap": {}}
 
 class PartitionStatus(Enum):
     UP = "UP"
@@ -63,12 +64,13 @@ class SlurmPartition:
     def has_running_job(self):
         return any(node.is_running_job() for node in self.slurm_nodes)
 
-    def get_online_node_by_type(self, terminate_drain_nodes, terminate_down_nodes):
+    def get_online_node_by_type(self, terminate_drain_nodes, terminate_down_nodes, ec2_missing_backing_instance_limit):
         online_compute_resources = set()
         if not self.state == "INACTIVE":
             for node in self.slurm_nodes:
                 if (
-                    node.is_healthy(terminate_drain_nodes, terminate_down_nodes, log_warn_if_unhealthy=False)
+                    node.is_healthy(terminate_drain_nodes, terminate_down_nodes,
+                                    ec2_missing_backing_instance_limit, log_warn_if_unhealthy=False)
                     and node.is_online()
                 ):
                     logger.debug("Currently online node: %s, node state: %s", node.name, node.state_string)
@@ -378,7 +380,7 @@ class SlurmNode(metaclass=ABCMeta):
         pass
 
     @abstractmethod
-    def is_bootstrap_failure(self):
+    def is_bootstrap_failure(self, ec2_missing_backing_instance_limit):
         """
         Check if a slurm node has boostrap failure.
 
@@ -394,7 +396,8 @@ class SlurmNode(metaclass=ABCMeta):
         pass
 
     @abstractmethod
-    def is_healthy(self, consider_drain_as_unhealthy, consider_down_as_unhealthy, log_warn_if_unhealthy=True):
+    def is_healthy(self, consider_drain_as_unhealthy, consider_down_as_unhealthy,
+                   ec2_missing_backing_instance_limit, log_warn_if_unhealthy=True):
         """Check if a slurm node is considered healthy."""
         pass
 
@@ -404,17 +407,52 @@ class SlurmNode(metaclass=ABCMeta):
         # for example because of a short SuspendTimeout
         return self.is_nodeaddr_set() and (self.is_power() or self.is_powering_down())
 
-    def is_backing_instance_valid(self, log_warn_if_unhealthy=True):
+    # ec2_discovery_cycle_limit set to -1 disable the discovery ec2 failure count
+    # ec2_discovery_cycle_limit has to be an odd number
+    #   since the is_backing_instance_valid is called 2 times per clustermgtd cycle and
+    #   only the first time is for the is_healthy
+    def is_backing_instance_valid(self, ec2_missing_backing_instance_limit, check_type, log_warn_if_unhealthy=True):
         """Check if a slurm node's addr is set, it points to a valid instance in EC2."""
         if self.is_nodeaddr_set():
             if not self.instance:
-                if log_warn_if_unhealthy:
-                    logger.warning(
-                        "Node state check: no corresponding instance in EC2 for node %s, node state: %s",
-                        self,
-                        self.state_string,
-                    )
-                return False
+                # If type event the cycle count has been already computed in the health check_type
+                if check_type == "event":
+                    if log_warn_if_unhealthy:
+                        logger.warning(
+                            "Node state check: no corresponding instance in EC2 for node %s, node state: %s",
+                            self,
+                            self.state_string,
+                        )
+                    return False
+                # Get the number of clustermgtd cycle from when the node is missing
+                logger.debug("node_failure_count: " + str(node_failure_count))
+                cycle_missing = node_failure_count[check_type].get(self.name, 0)
+                if cycle_missing >= ec2_missing_backing_instance_limit:
+                    # If the limit has been reach mark the node as down
+                    node_failure_count[check_type].pop(self.name, None)
+                    if log_warn_if_unhealthy:
+                        logger.warning(
+                            "Node state check: no corresponding instance in EC2 for node %s, node state: %s",
+                            self,
+                            self.state_string,
+                        )
+                    return False
+                else:
+                    # If the limit has not been reach increase the count and is backing instance still valid
+                    node_failure_count[check_type][self.name] = cycle_missing + 1
+                    if log_warn_if_unhealthy:
+                        logger.warning(
+                            "Node state check: no corresponding instance in EC2 for node %s, node state: %s."
+                            " Retry left: %s",
+                            self,
+                            self.state_string,
+                            str(ec2_missing_backing_instance_limit - cycle_missing)
+                        )
+                    return True
+            else:
+                # Reset node failure count if the feature is enabled
+                if ec2_missing_backing_instance_limit != -1 and check_type != "event":
+                    node_failure_count[check_type].pop(self.name, None)
         return True
 
     @abstractmethod
@@ -478,11 +516,14 @@ class StaticNode(SlurmNode):
             reservation_name=reservation_name,
         )
 
-    def is_healthy(self, consider_drain_as_unhealthy, consider_down_as_unhealthy, log_warn_if_unhealthy=True):
+    def is_healthy(self, consider_drain_as_unhealthy, consider_down_as_unhealthy,
+                   ec2_missing_backing_instance_limit, log_warn_if_unhealthy=True):
         """Check if a slurm node is considered healthy."""
         return (
             self._is_static_node_ip_configuration_valid(log_warn_if_unhealthy=log_warn_if_unhealthy)
-            and self.is_backing_instance_valid(log_warn_if_unhealthy=log_warn_if_unhealthy)
+            and self.is_backing_instance_valid(ec2_missing_backing_instance_limit=ec2_missing_backing_instance_limit,
+                                               check_type="health",
+                                               log_warn_if_unhealthy=log_warn_if_unhealthy)
             and self.is_state_healthy(
                 consider_drain_as_unhealthy, consider_down_as_unhealthy, log_warn_if_unhealthy=log_warn_if_unhealthy
             )
@@ -533,9 +574,12 @@ class StaticNode(SlurmNode):
             return False
         return True
 
-    def is_bootstrap_failure(self):
+    def is_bootstrap_failure(self, ec2_missing_backing_instance_limit):
         """Check if a slurm node has boostrap failure."""
-        if self.is_static_nodes_in_replacement and not self.is_backing_instance_valid(log_warn_if_unhealthy=False):
+        if self.is_static_nodes_in_replacement and not self.is_backing_instance_valid(
+                ec2_missing_backing_instance_limit=ec2_missing_backing_instance_limit,
+                check_type="bootstrap",
+                log_warn_if_unhealthy=False):
             # Node is currently in replacement and no backing instance
             logger.warning(
                 "Node bootstrap error: Node %s is currently in replacement and no backing instance, node state: %s",
@@ -618,17 +662,22 @@ class DynamicNode(SlurmNode):
             return False
         return True
 
-    def is_healthy(self, consider_drain_as_unhealthy, consider_down_as_unhealthy, log_warn_if_unhealthy=True):
+    def is_healthy(self, consider_drain_as_unhealthy, consider_down_as_unhealthy,
+                   ec2_missing_backing_instance_limit, log_warn_if_unhealthy=True):
         """Check if a slurm node is considered healthy."""
-        return self.is_backing_instance_valid(log_warn_if_unhealthy=log_warn_if_unhealthy) and self.is_state_healthy(
+        return self.is_backing_instance_valid(ec2_missing_backing_instance_limit=ec2_missing_backing_instance_limit,
+                                              check_type="health",
+                                              log_warn_if_unhealthy=log_warn_if_unhealthy) and self.is_state_healthy(
             consider_drain_as_unhealthy, consider_down_as_unhealthy, log_warn_if_unhealthy=log_warn_if_unhealthy
         )
 
-    def is_bootstrap_failure(self):
+    def is_bootstrap_failure(self, ec2_missing_backing_instance_limit):
         """Check if a slurm node has boostrap failure."""
         # no backing instance + [working state]# in node state
         if (self.is_configuring_job() or self.is_powering_up_idle()) and not self.is_backing_instance_valid(
-            log_warn_if_unhealthy=False
+            ec2_missing_backing_instance_limit=ec2_missing_backing_instance_limit,
+            check_type="bootstrap",
+            log_warn_if_unhealthy=False,
         ):
             logger.warning(
                 "Node bootstrap error: Node %s is in power up state without valid backing instance, node state: %s",

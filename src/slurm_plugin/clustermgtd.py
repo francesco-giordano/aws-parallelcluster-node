@@ -162,6 +162,7 @@ class ClustermgtdConfig:
         "use_private_hostname": False,
         "protected_failure_count": 10,
         "insufficient_capacity_timeout": 600,
+        "ec2_missing_backing_instance_limit": -1,
         # Compute console logging configs
         "compute_console_logging_enabled": True,
         "compute_console_logging_max_sample_size": 1,
@@ -302,6 +303,11 @@ class ClustermgtdConfig:
         )
         self.disable_nodes_on_insufficient_capacity = self.insufficient_capacity_timeout > 0
 
+    def _get_ec2_missing_backing_instance_limit_config(self, config):
+        self.ec2_missing_backing_instance_limit = config.getint(
+            "clustermgtd", "ec2_missing_backing_instance_limit", fallback=self.DEFAULTS.get("ec2_missing_backing_instance_limit")
+        )
+
     def _get_dns_config(self, config):
         """Get config option related to Route53 DNS domain."""
         self.hosted_zone = config.get("clustermgtd", "hosted_zone", fallback=self.DEFAULTS.get("hosted_zone"))
@@ -347,6 +353,7 @@ class ClustermgtdConfig:
         self._get_launch_config(self._config)
         self._get_terminate_config(self._config)
         self._get_dns_config(self._config)
+        self._get_ec2_missing_backing_instance_limit_config(self._config)
         self._get_compute_console_output_config(self._config)
         self._get_worker_pool_config(self._config)
 
@@ -488,7 +495,8 @@ class ClusterManager:
         partitions_protected_failure_count_map = self._partitions_protected_failure_count_map.copy()
         for partition, failures_per_compute_resource in partitions_protected_failure_count_map.items():
             partition_online_compute_resources = partitions_name_map[partition].get_online_node_by_type(
-                self._config.terminate_drain_nodes, self._config.terminate_down_nodes
+                self._config.terminate_drain_nodes, self._config.terminate_down_nodes,
+                self._config.ec2_missing_backing_instance_limit
             )
             for compute_resource in failures_per_compute_resource.keys():
                 if compute_resource in partition_online_compute_resources:
@@ -758,6 +766,7 @@ class ClusterManager:
             if not node.is_healthy(
                 consider_drain_as_unhealthy=self._config.terminate_drain_nodes,
                 consider_down_as_unhealthy=self._config.terminate_down_nodes,
+                ec2_missing_backing_instance_limit=self._config.ec2_missing_backing_instance_limit,
                 log_warn_if_unhealthy=node.name not in reserved_nodenames,
             ):
                 if not self._config.disable_capacity_blocks_management and node.name in reserved_nodenames:
@@ -774,7 +783,9 @@ class ClusterManager:
                     ).append(node)
                 else:
                     unhealthy_dynamic_nodes.append(node)
-        self._event_publisher.publish_unhealthy_node_events(all_unhealthy_nodes)
+        self._event_publisher.publish_unhealthy_node_events(
+            self._config.ec2_missing_backing_instance_limit,
+            all_unhealthy_nodes)
         return (
             unhealthy_dynamic_nodes,
             unhealthy_static_nodes,
@@ -1159,11 +1170,10 @@ class ClusterManager:
         """Check if a static node is in replacement but replacement time is expired."""
         return self._is_node_in_replacement_valid(node, check_node_is_valid=False)
 
-    @staticmethod
-    def _find_bootstrap_failure_nodes(slurm_nodes):
+    def _find_bootstrap_failure_nodes(self, slurm_nodes):
         bootstrap_failure_nodes = []
         for node in slurm_nodes:
-            if node.is_bootstrap_failure():
+            if node.is_bootstrap_failure(self._config.ec2_missing_backing_instance_limit):
                 bootstrap_failure_nodes.append(node)
         return bootstrap_failure_nodes
 
