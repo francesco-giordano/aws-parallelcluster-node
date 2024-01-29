@@ -38,6 +38,8 @@ EC2_SCHEDULED_EVENT_CODES = [
 
 CONFIG_FILE_DIR = "/etc/parallelcluster/slurm_plugin"
 
+ec2_missing_backing_instance_limit = 2
+node_failure_count = {}
 
 class PartitionStatus(Enum):
     UP = "UP"
@@ -233,6 +235,7 @@ class SlurmNode(metaclass=ABCMeta):
         self.is_failing_health_check = False
         self.error_code = self._parse_error_code()
         self.queue_name, self._node_type, self.compute_resource_name = parse_nodename(name)
+        self.ec2_backing_instance = None
 
     def is_nodeaddr_set(self):
         """Check if nodeaddr(private ip) for the node is set."""
@@ -406,16 +409,40 @@ class SlurmNode(metaclass=ABCMeta):
 
     def is_backing_instance_valid(self, log_warn_if_unhealthy=True):
         """Check if a slurm node's addr is set, it points to a valid instance in EC2."""
+        if self.ec2_backing_instance is not None:
+            return self.ec2_backing_instance
+
+        logger.debug("node_failure_count: " + str(node_failure_count))
+        self.ec2_backing_instance = True
         if self.is_nodeaddr_set():
             if not self.instance:
-                if log_warn_if_unhealthy:
-                    logger.warning(
-                        "Node state check: no corresponding instance in EC2 for node %s, node state: %s",
-                        self,
-                        self.state_string,
-                    )
-                return False
-        return True
+                cycle_missing = node_failure_count.get(self.name, 0)
+                if cycle_missing >= ec2_missing_backing_instance_limit:
+                    if log_warn_if_unhealthy:
+                        logger.warning(
+                            "Node state check: no corresponding instance in EC2 for node %s, node state: %s",
+                            self,
+                            self.state_string
+                        )
+                    node_failure_count.pop(self.name, None)
+                    self.ec2_backing_instance = False
+                else:
+                    # If the limit has not been reach increase the count and is backing instance still valid
+                    if log_warn_if_unhealthy:
+                        logger.warning(
+                            "Node state check: no corresponding instance in EC2 for node %s, node state: %s."
+                            " Retry left: %s",
+                            self,
+                            self.state_string,
+                            str(ec2_missing_backing_instance_limit - cycle_missing)
+                        )
+                    node_failure_count[self.name] = cycle_missing + 1
+            else:
+                node_failure_count.pop(self.name, None)
+        else:
+            node_failure_count.pop(self.name, None)
+
+        return self.ec2_backing_instance
 
     @abstractmethod
     def needs_reset_when_inactive(self):
